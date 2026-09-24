@@ -91,3 +91,7 @@ cap. The wording is left as Trust & Will wrote it.
   optional. There is an initial line on the "Powers of Health Care Agent" page.
 - Handwritten at signing: county on each notary block, dates of birth on the
   directive and HIPAA signature pages.
+
+## License
+
+MIT. See `LICENSE`.
