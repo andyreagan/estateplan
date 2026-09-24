@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import difflib
+import html
 import json
 import os
 import re
@@ -36,6 +37,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 HERE = Path(__file__).resolve().parent
 DB_PATH = HERE / "estateplan.db"
@@ -180,6 +182,10 @@ def load_data(con: sqlite3.Connection, data: dict) -> None:
     for table in ("gift", "role", "principal", "person"):
         con.execute(f"DELETE FROM {table}")
     ids: dict[str, int] = {}
+    names = [p["full_name"] for p in data["people"]]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise ValueError(f"duplicate full_name in data (roles are keyed by name): {', '.join(dupes)}")
     for person in data["people"]:
         row = {k: person.get(k, "") for k in PERSON_FIELDS}
         cur = con.execute(
@@ -266,6 +272,30 @@ def load_context(con: sqlite3.Connection, principal_id: int) -> dict:
         date=dt.date.today().strftime("%B %d, %Y").replace(" 0", " "),
     )
     return ctx
+
+
+def safe_name(name: str) -> str:
+    """A person's name as a single path segment: no separators, no traversal."""
+    cleaned = re.sub(r"[\\/\0]", " ", name).strip().strip(".")
+    return cleaned or "unnamed"
+
+
+def pdf_context(ctx: dict) -> dict:
+    """Copy of the context with every user-supplied string XML-escaped, because
+    reportlab Paragraph parses its text as markup. Templates add their own tags."""
+    def esc(v):
+        if isinstance(v, str):
+            return xml_escape(v)
+        if isinstance(v, dict):
+            return {k: esc(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [esc(x) for x in v]
+        return v
+    return esc(ctx)
+
+
+def doc_blocks(doc: str, ctx: dict) -> list:
+    return TEMPLATES[doc](pdf_context(ctx))
 
 
 def list_principals(con):
@@ -406,10 +436,11 @@ def will_blocks(c: dict) -> list:
         ("p", "A beneficiary must survive me for at least 120 hours to receive property under this Will. As used in this "
               "Will, to \"survive\" me means to be alive or in existence as an organization 120 hours after my death."),
         ("h1", "Executor of Estate"),
-        ("p", f"I nominate {execs[0]} to act as my Executor and Personal Representative (\"Executor\"). If {execs[0]} fails "
-              "or ceases to act as my Executor, I nominate the following Backup Executors, in the order named, to act as "
-              "my successor Executor:"),
     ]
+    primary = execs[0] if execs else "______________________________"
+    b.append(("p", f"I nominate {primary} to act as my Executor and Personal Representative (\"Executor\"). If {primary} "
+                   "fails or ceases to act as my Executor, I nominate the following Backup Executors, in the order named, "
+                   "to act as my successor Executor:"))
     backups = execs[1:]
     for i, e in enumerate(backups, 1):
         tail = "; then" if i < len(backups) else ";"
@@ -625,7 +656,7 @@ def ahcd_blocks(c: dict) -> list:
     name = c["name"]
     state = c["state_name"]
     agents = c["roles"]["health_agent"]
-    ordinal = ["First", "Second", "Third", "Fourth", "Fifth"]
+    ordinal = ["First", "Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh", "Eighth", "Ninth", "Tenth"]
     b: list = [("cover", "Advance Health Care Directive for", name)]
     b += [
         ("p", f"I, {name}, make this Health Care Directive to designate a health care agent, specify the powers of my "
@@ -645,7 +676,8 @@ def ahcd_blocks(c: dict) -> list:
                        "for any reason, then I nominate the following individuals, in the order named to serve as my "
                        "Health Care Agent:"))
         for i, a in enumerate(agents[1:]):
-            b.append(("h2", f"{ordinal[i]} Alternate Agent:"))
+            label = ordinal[i] if i < len(ordinal) else f"No. {i + 1}"
+            b.append(("h2", f"{label} Alternate Agent:"))
             b += agent_fields(a)
     b += [
         ("h1", "Effectiveness"),
@@ -1503,10 +1535,10 @@ def blocks_to_text(blocks: list) -> str:
             out.append("\n".join(blk[1:]))
             out.append("")
         elif kind in ("h1", "h2", "p", "indent", "li"):
-            out.append(_TAG_RE.sub("", blk[1]).replace("<br/>", "\n"))
+            out.append(html.unescape(_TAG_RE.sub("", blk[1].replace("<br/>", "\n"))))
             out.append("")
         elif kind == "field":
-            val = _TAG_RE.sub("", blk[2]).replace("<br/>", "\n")
+            val = html.unescape(_TAG_RE.sub("", blk[2].replace("<br/>", "\n")))
             out.append(f"{blk[1]} {val}".rstrip())
         elif kind == "sig":
             out.append("    ".join(x.replace("<br/>", " / ") for x in blk[1] if x))
@@ -1546,7 +1578,7 @@ def render_pdf(doc: str, ctx: dict, path: Path) -> None:
     value = ParagraphStyle("value", fontName="Helvetica", fontSize=10, leading=13)
     sigl = ParagraphStyle("sigl", fontName="Helvetica", fontSize=9, leading=12)
 
-    header_text = HEADERS[doc].format(name=ctx["name"])
+    header_text = HEADERS[doc].format(name=xml_escape(ctx["name"]))
     date_text = ctx["date"]
     width = letter[0] - 2 * inch
 
@@ -1554,7 +1586,7 @@ def render_pdf(doc: str, ctx: dict, path: Path) -> None:
         canvas.saveState()
         if d.page > 1:
             canvas.setFont("Times-Bold", 9)
-            canvas.drawString(inch, letter[1] - 0.6 * inch, header_text)
+            canvas.drawString(inch, letter[1] - 0.6 * inch, html.unescape(header_text))
         canvas.setFont("Helvetica-Bold", 8)
         canvas.drawCentredString(letter[0] / 2, 0.55 * inch, f"Page {d.page}")
         canvas.setFont("Helvetica", 8)
@@ -1562,7 +1594,7 @@ def render_pdf(doc: str, ctx: dict, path: Path) -> None:
         canvas.restoreState()
 
     flow = []
-    for blk in TEMPLATES[doc](ctx):
+    for blk in doc_blocks(doc, ctx):
         kind = blk[0]
         if kind == "cover":
             flow.append(Spacer(1, 0.2 * inch))
@@ -1612,7 +1644,7 @@ def render_pdf(doc: str, ctx: dict, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     SimpleDocTemplate(
         str(path), pagesize=letter, leftMargin=inch, rightMargin=inch, topMargin=inch, bottomMargin=inch,
-        title=header_text, author=ctx["name"],
+        title=html.unescape(header_text), author=ctx["name"],
     ).build(flow, onFirstPage=on_page, onLaterPages=on_page)
 
 
@@ -1620,11 +1652,11 @@ def build_all(con: sqlite3.Connection, out: Path) -> list[Path]:
     written = []
     for prow in list_principals(con):
         ctx = load_context(con, prow["id"])
-        folder = out / ctx["name"]
+        folder = out / safe_name(ctx["name"])
         for key, title in DOCS.items():
             pdf = folder / f"{title}.pdf"
             render_pdf(key, ctx, pdf)
-            (folder / f"{title}.txt").write_text(blocks_to_text(TEMPLATES[key](ctx)))
+            (folder / f"{title}.txt").write_text(blocks_to_text(doc_blocks(key, ctx)))
             written.append(pdf)
     return written
 
@@ -1676,7 +1708,7 @@ def verify(con: sqlite3.Connection, originals: Path, out: Path) -> int:
     for prow in list_principals(con):
         name = prow["full_name"]
         for title in DOCS.values():
-            gen = out / name / f"{title}.pdf"
+            gen = out / safe_name(name) / f"{title}.pdf"
             candidates = [d for d in originals.iterdir() if d.is_dir() and d.name.split()[0] == name.split()[0]]
             if not candidates:
                 print(f"== {name} / {title}: no original folder found")
@@ -1724,12 +1756,30 @@ form.inline{display:inline}button{font:inherit;padding:3px 9px;cursor:pointer}
 </body></html>"""
 
 
-def create_app(con_factory):
-    from flask import Flask, abort, flash, redirect, render_template_string, request, send_file, url_for
+def create_app(db_path: Path):
+    from flask import Flask, abort, flash, g, redirect, render_template_string, request, send_file
     from markupsafe import escape
 
     app = Flask(__name__)
-    app.secret_key = "estateplan-local"
+    app.secret_key = os.urandom(16)
+    connect(db_path).close()  # create schema / seed once
+
+    def con_factory() -> sqlite3.Connection:
+        if "con" not in g:
+            g.con = sqlite3.connect(db_path)
+            g.con.row_factory = sqlite3.Row
+            g.con.execute("PRAGMA foreign_keys = ON")
+        return g.con
+
+    @app.teardown_appcontext
+    def _close(_exc):
+        con = g.pop("con", None)
+        if con is not None:
+            con.close()
+
+    def name_taken(con, name: str, exclude_id: int | None = None) -> bool:
+        row = con.execute("SELECT id FROM person WHERE full_name=?", (name,)).fetchone()
+        return row is not None and row["id"] != exclude_id
 
     def page(body):
         return render_template_string(PAGE, body=body)
@@ -1781,6 +1831,10 @@ def create_app(con_factory):
     def person_new():
         con = con_factory()
         if request.method == "POST":
+            name = request.form.get("full_name", "").strip()
+            if not name or name_taken(con, name):
+                flash("A full name is required and must be unique (roles are keyed by name).")
+                return redirect("/people/new")
             con.execute("INSERT INTO person(full_name,address,phone,email,birth_date,notes) VALUES (?,?,?,?,?,?)",
                         tuple(request.form.get(k, "").strip() for k in ("full_name", "address", "phone", "email", "birth_date", "notes")))
             con.commit()
@@ -1795,6 +1849,10 @@ def create_app(con_factory):
         if p is None:
             abort(404)
         if request.method == "POST":
+            name = request.form.get("full_name", "").strip()
+            if not name or name_taken(con, name, exclude_id=pid):
+                flash("A full name is required and must be unique (roles are keyed by name).")
+                return redirect(f"/people/{pid}")
             con.execute("UPDATE person SET full_name=?,address=?,phone=?,email=?,birth_date=?,notes=? WHERE id=?",
                         tuple(request.form.get(k, "").strip() for k in ("full_name", "address", "phone", "email", "birth_date", "notes")) + (pid,))
             con.commit()
@@ -1949,7 +2007,7 @@ def create_app(con_factory):
             abort(404)
         con = con_factory()
         ctx = load_context(con, pid)
-        path = OUT_DIR / "_preview" / ctx["name"] / f"{DOCS[doc]}.pdf"
+        path = OUT_DIR / "_preview" / safe_name(ctx["name"]) / f"{DOCS[doc]}.pdf"
         render_pdf(doc, ctx, path)
         return send_file(path, mimetype="application/pdf", max_age=0)
 
@@ -1967,7 +2025,7 @@ def create_app(con_factory):
     @app.route("/output/<path:rel>")
     def output(rel):
         path = (OUT_DIR / rel).resolve()
-        if OUT_DIR.resolve() not in path.parents or not path.exists():
+        if OUT_DIR.resolve() not in path.parents or not path.is_file():
             abort(404)
         return send_file(path, max_age=0)
 
@@ -2014,7 +2072,7 @@ def main(argv=None):
 
     con = connect(DB_PATH)
     if cmd == "serve":
-        app = create_app(lambda: connect(DB_PATH))
+        app = create_app(DB_PATH)
         print(f"estate plan editor: http://{args.host}:{args.port}/")
         app.run(host=args.host, port=args.port, debug=False)
     elif cmd == "build":
@@ -2028,7 +2086,7 @@ def main(argv=None):
                 pid = row["id"]
         if pid is None:
             raise SystemExit("unknown principal")
-        print(blocks_to_text(TEMPLATES[args.doc](load_context(con, pid))))
+        print(blocks_to_text(doc_blocks(args.doc, load_context(con, pid))))
     elif cmd == "verify":
         n = verify(con, args.originals, args.out)
         sys.exit(1 if n else 0)
