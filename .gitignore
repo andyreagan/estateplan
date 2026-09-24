@@ -1,0 +1,12 @@
+# personal data stays out of the repo (and out of any cloud review bundle)
+estateplan.db
+output/
+Estate Plan*.zip
+Estate Plan 2026-09-23/
+*.pdf
+*.png
+will-*.txt
+__pycache__/
+*.local.json
+NOTES.md
+.DS_Store
